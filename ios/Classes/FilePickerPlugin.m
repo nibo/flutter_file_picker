@@ -23,6 +23,7 @@
 @property (nonatomic) BOOL loadDataToMemory;
 @property (nonatomic) BOOL allowCompression;
 @property (nonatomic) dispatch_group_t group;
+@property (nonatomic) BOOL isSaveFile;
 @property (nonatomic) MediaType type;
 @end
 
@@ -120,7 +121,7 @@
         self.allowedExtensions = [FileUtils resolveType:call.method withAllowedExtensions: [arguments valueForKey:@"allowedExtensions"]];
         if(self.allowedExtensions == nil) {
             _result([FlutterError errorWithCode:@"Unsupported file extension"
-                                        message:@"If you are providing extension filters make sure that you are only using FileType.custom and the extension are provided without the dot, (ie., jpg instead of .jpg). This could also have happened because you are using an unsupported file extension. If the problem persists, you may want to consider using FileType.all instead."
+                                        message:@"If you are providing extension filters make sure that you are only using FileType.custom and the extension are provided without the dot, (ie., jpg instead of .jpg). This could also have happened because you are using an unsupported file extension. If the problem persists, you may want to consider using FileType.any instead."
                                         details:nil]);
             _result = nil;
         } else if(self.allowedExtensions != nil) {
@@ -148,6 +149,12 @@
                                     message:@"Support for the Audio picker is not compiled in. Remove the Pod::PICKER_AUDIO=false statement from your Podfile."
                                     details:nil]);
 #endif
+    } else if([call.method isEqualToString:@"save"]) {
+        NSString *fileName = [arguments valueForKey:@"fileName"];
+        NSString *fileType = [arguments valueForKey:@"fileType"];
+        NSString *initialDirectory = [arguments valueForKey:@"initialDirectory"];
+        FlutterStandardTypedData *bytes = [arguments valueForKey:@"bytes"];
+        [self saveFileWithName:fileName fileType:fileType initialDirectory:initialDirectory bytes: bytes];
     } else {
         result(FlutterMethodNotImplemented);
         _result = nil;
@@ -161,9 +168,40 @@
 
 #pragma mark - Resolvers
 
+- (void)saveFileWithName:(NSString*)fileName fileType:(NSString *)fileType initialDirectory:(NSString*)initialDirectory bytes:(FlutterStandardTypedData*)bytes{
+    self.isSaveFile = YES;
+    NSFileManager* fm = [NSFileManager defaultManager];
+    NSURL* documentsDirectory = [fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask][0];
+    NSURL* destinationPath = [documentsDirectory URLByAppendingPathComponent:fileName];
+    NSError* error;
+    if ([fm fileExistsAtPath:destinationPath.path]) {
+        [fm removeItemAtURL:destinationPath error:&error];
+        if (error != nil) {
+            _result([FlutterError errorWithCode:@"Failed to remove file" message:[error debugDescription] details:nil]);
+            error = nil;
+        }
+    }
+    if(bytes != nil){
+        [bytes.data writeToURL:destinationPath options:NSDataWritingAtomic error:&error];
+        if (error != nil) {
+            _result([FlutterError errorWithCode:@"Failed to write file" message:[error debugDescription] details:nil]);
+            error = nil;
+        }
+    }
+    self.documentPickerController = [[UIDocumentPickerViewController alloc] initWithURL:destinationPath inMode:UIDocumentPickerModeExportToService];
+    self.documentPickerController.delegate = self;
+    self.documentPickerController.presentationController.delegate = self;
+    if(@available(iOS 13, *)){
+       if(![[NSNull null] isEqual:initialDirectory] && ![@"" isEqualToString:initialDirectory]){
+            self.documentPickerController.directoryURL = [NSURL URLWithString:initialDirectory];
+        }
+    }
+    [[self viewControllerWithWindow:nil] presentViewController:self.documentPickerController animated:YES completion:nil];
+}
+
 #ifdef PICKER_DOCUMENT
 - (void)resolvePickDocumentWithMultiPick:(BOOL)allowsMultipleSelection pickDirectory:(BOOL)isDirectory {
-
+    self.isSaveFile = NO;
     @try{
         self.documentPickerController = [[UIDocumentPickerViewController alloc]
                                          initWithDocumentTypes: isDirectory ? @[@"public.folder"] : self.allowedExtensions
@@ -369,6 +407,11 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls{
     if(_result == nil) {
         return;
     }
+    if(self.isSaveFile){
+        _result(urls[0].path);
+        _result = nil;
+        return;
+    }
     NSMutableArray<NSURL *> *newUrls = [NSMutableArray new];
     for (NSURL *url in urls) {
         // Create file URL to temporary folder
@@ -485,26 +528,23 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls{
     }
 
     __block NSError * blockError;
-
-    bool isImageSelection = self.type == IMAGE;
-    NSString * utiType = isImageSelection ? @"public.image" : @"public.audiovisual-content";
-
+    
     for (NSInteger index = 0; index < results.count; ++index) {
-        [urls addObject:[NSNull null]];
+        [urls addObject:[NSURL URLWithString:@""]];
 
         dispatch_group_enter(_group);
 
         PHPickerResult * result = [results objectAtIndex: index];
 
-        [result.itemProvider loadFileRepresentationForTypeIdentifier:utiType completionHandler:^(NSURL * _Nullable url, NSError * _Nullable error) {
-
+        [result.itemProvider loadFileRepresentationForTypeIdentifier:@"public.item" completionHandler:^(NSURL * _Nullable url, NSError * _Nullable error) {
+            
             if(url == nil) {
                 blockError = error;
                 Log("Could not load the picked given file: %@", blockError);
                 dispatch_group_leave(self->_group);
                 return;
             }
-
+            
             long timestamp = (long)([[NSDate date] timeIntervalSince1970] * 1000);
             NSString * filenameWithoutExtension = [url.lastPathComponent stringByDeletingPathExtension];
             NSString * fileExtension = url.pathExtension;
@@ -512,13 +552,13 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls{
             NSString * extension = [filename pathExtension];
             NSFileManager * fileManager = [[NSFileManager alloc] init];
             NSURL * cachedUrl;
-
+            
             // Check for live photos
             if(self.allowCompression && [extension isEqualToString:@"pvt"]) {
                 NSArray * files = [fileManager contentsOfDirectoryAtURL:url includingPropertiesForKeys:@[] options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
-
+                
                 for (NSURL * item in files) {
-
+                    
                     if (UTTypeConformsTo(UTTypeCreatePreferredIdentifierForTag(kUTTagClassFilenameExtension, CFBridgingRetain([item pathExtension]), NULL), kUTTypeImage)) {
                         NSData *assetData = [NSData dataWithContentsOfURL:item];
                         //Convert any type of image to jpeg
@@ -535,7 +575,7 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls{
                         if([fileManager fileExistsAtPath:tmpFile]) {
                             [fileManager removeItemAtPath:tmpFile error:nil];
                         }
-
+                        
                         if([fileManager createFileAtPath:tmpFile contents:data attributes:nil]) {
                             filename = tmpFile;
                         } else {
@@ -546,36 +586,36 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls{
                 }
             } else {
                 NSString * cachedFile = [NSTemporaryDirectory() stringByAppendingPathComponent:filename];
-
+                
                 if([fileManager fileExistsAtPath:cachedFile]) {
                     [fileManager removeItemAtPath:cachedFile error:NULL];
                 }
-
+                
                 cachedUrl = [NSURL fileURLWithPath: cachedFile];
-
+                
                 NSError *copyError;
                 [fileManager copyItemAtURL: url
                                      toURL: cachedUrl
                                      error: &copyError];
-
+                
                 if (copyError) {
                     Log("%@ Error while caching picked file: %@", self, copyError);
                     return;
                 }
             }
-
-
+            
+            
             [urls replaceObjectAtIndex:index withObject:cachedUrl];
             dispatch_group_leave(self->_group);
         }];
     }
-
+    
     dispatch_group_notify(_group, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),^{
         self->_group = nil;
         if(self->_eventSink != nil) {
             self->_eventSink([NSNumber numberWithBool:NO]);
         }
-
+        
         if(blockError) {
             self->_result([FlutterError errorWithCode:@"file_picker_error"
                                         message:@"Temporary file could not be created"
@@ -596,26 +636,26 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls{
 {
     [mediaPicker dismissViewControllerAnimated:YES completion:NULL];
     int numberOfItems = (int)[mediaItemCollection items].count;
-
+    
     if(numberOfItems == 0) {
         return;
     }
-
+    
     if(_eventSink != nil) {
         _eventSink([NSNumber numberWithBool:YES]);
     }
-
+    
     NSMutableArray<NSURL *> * urls = [[NSMutableArray alloc] initWithCapacity:numberOfItems];
-
+    
     for(MPMediaItemCollection * item in [mediaItemCollection items]) {
         NSURL * cachedAsset = [FileUtils exportMusicAsset: [item valueForKey:MPMediaItemPropertyAssetURL] withName: [item valueForKey:MPMediaItemPropertyTitle]];
         [urls addObject: cachedAsset];
     }
-
+    
     if(_eventSink != nil) {
         _eventSink([NSNumber numberWithBool:NO]);
     }
-
+    
     if(urls.count == 0) {
         Log(@"Couldn't retrieve the audio file path, either is not locally downloaded or the file is DRM protected.");
     }
